@@ -20,14 +20,6 @@ pwd()
 # ╔═╡ 3e49e54c-5d22-4c2c-9d3f-708848b64de7
 ta = readtimearray("rate.csv", format="mm/dd/yy", delim=',')
 
-# ╔═╡ 891add0b-c54d-4a18-bde1-f2f0a5e3de85
-begin
-	a = values(ta[:"10 YR"])
-	n = length(a)
-	@show a[n-10:n]
-	@show length(a[n-10:n-1])
-end
-
 # ╔═╡ 104966d5-6c4a-4c48-be19-0d9c72977d62
 function get_src_trg(
     sequence, 
@@ -70,10 +62,10 @@ end
 # ╔═╡ cbf568ae-c0cc-4f21-b14b-07ca25124419
 begin
 	#define 2 layer of transformer
-	encode_t1 = Transformer(dim_val, n_heads, 64, 2048)
+	encode_t1 = Transformer(dim_val, n_heads, 64, 2048;future=false,pdrop-0.2)
 	
 	#define 2 layer of transformer decoder
-	decode_t1 = TransformerDecoder(dim_val, n_heads, 64, 2048)
+	decode_t1 = TransformerDecoder(dim_val, n_heads, 64, 2048,pdrop-0.2)
 
 	encoder_input_layer = Dense(input_size,dim_val)
 	decoder_input_layer = Dense(input_size,dim_val)
@@ -916,7 +908,6 @@ uuid = "3f19e933-33d8-53b3-aaab-bd5110c3b7a0"
 # ╠═17ae79d1-22b2-4dbc-9029-3faa82b34201
 # ╠═57c64197-8bbe-471f-b529-a844039e0139
 # ╠═3e49e54c-5d22-4c2c-9d3f-708848b64de7
-# ╠═891add0b-c54d-4a18-bde1-f2f0a5e3de85
 # ╠═104966d5-6c4a-4c48-be19-0d9c72977d62
 # ╠═3b2f421a-a17c-4b18-82cc-776eaef9357b
 # ╠═cbf568ae-c0cc-4f21-b14b-07ca25124419
