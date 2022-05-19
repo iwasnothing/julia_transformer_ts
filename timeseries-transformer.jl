@@ -12,10 +12,13 @@ begin
 	using TimeSeries
 	using Flux: gradient
 	using Flux.Optimise: update!
+	using BSON: @save
+	#using TensorBoardLogger, Logging
+	#using CUDA
 end
 
 # ╔═╡ 57c64197-8bbe-471f-b529-a844039e0139
-pwd()
+#gpu_enabled = enable_gpu(true)
 
 # ╔═╡ 3e49e54c-5d22-4c2c-9d3f-708848b64de7
 ta = readtimearray("rate.csv", format="mm/dd/yy", delim=',')
@@ -62,39 +65,34 @@ end
 # ╔═╡ cbf568ae-c0cc-4f21-b14b-07ca25124419
 begin
 	#define 2 layer of transformer
-	encode_t1 = Transformer(dim_val, n_heads, 64, 2048;future=false,pdrop-0.2)
+	encode_t1 = Transformer(dim_val, n_heads, 64, 2048;future=false,pdrop=0.2)|> gpu
 	
 	#define 2 layer of transformer decoder
-	decode_t1 = TransformerDecoder(dim_val, n_heads, 64, 2048,pdrop-0.2)
+	decode_t1 = TransformerDecoder(dim_val, n_heads, 64, 2048,pdrop=0.2) |> gpu
 
-	encoder_input_layer = Dense(input_size,dim_val)
-	decoder_input_layer = Dense(input_size,dim_val)
-	positional_encoding_layer = PositionEmbedding(dim_val)
+	encoder_input_layer = Dense(input_size,dim_val) |> gpu
+	decoder_input_layer = Dense(input_size,dim_val) |> gpu
+	positional_encoding_layer = PositionEmbedding(dim_val) |> gpu
 	p = 0.2
-	dropout_encoder = Dropout(p)
-	dropout_decoder = Dropout(p)
-	dropout_pos_enc = Dropout(p)
+	dropout_pos_enc = Dropout(p) |> gpu
 	
 	#define the layer to get the final output probabilities
 	#linear = Positionwise(Dense(dim_val, output_sequence_length))
-	linear = Dense(output_sequence_length*dim_val,output_sequence_length)
+	linear = Dense(output_sequence_length*dim_val,output_sequence_length) |> gpu
 	function encoder_forward(x)
 	  x = encoder_input_layer(x)
 	  e = positional_encoding_layer(x)
 	  t1 = x .+ e
 	  e = dropout_pos_enc(t1)
 	  t1 = encode_t1(t1)
-	  t1 = dropout_encoder(t1)
 	  return t1
 	end
 	
 	function decoder_forward(tgt, t1)
 	  decoder_output = decoder_input_layer(tgt)
 	  t2 = decode_t1(decoder_output,t1)
-	  t2 = dropout_decoder(t2)
 	  t2 = Flux.flatten(t2)
 	  p = linear(t2)
-	  
 	  return p
 	end
 end
@@ -119,13 +117,16 @@ end
 
 # ╔═╡ b9698341-42c8-4354-93fc-6cec0b606416
 begin
+	#lg=TBLogger("tensorboard_logs/run", min_level=Logging.Info)
 	data = generate_seq(values(ta[:"10 YR"]),enc_seq_len+output_sequence_length)
 	data = reduce(hcat,data)
 	data = convert(Array{Float32,2}, data)
+	@show size(data)
+	data = data[:,1:32]
 	ps = params(encoder_input_layer, positional_encoding_layer, encode_t1, decoder_input_layer, decode_t1,  linear)
-	opt = ADAM(1e-4)
+	opt = ADAM(1e-2)
 	train_loader = Flux.Data.DataLoader(data, batchsize=32) 
-	for i = 1:1000
+	for i = 1:10
 		for x in train_loader
 			sz = size(x)
 			sub_sequence = reshape(x,(1,sz[1],sz[2]))
@@ -135,10 +136,20 @@ begin
 							    dec_seq_len,
 							    output_sequence_length
 							    )
+			@show size(src)
+			
+			#src, trg, trg_y = todevice(src, trg, trg_y) #move to gpu
 			grad = gradient(()->loss(src, trg, trg_y), ps)
-		    if i % 10 == 0
-		        l = loss(x, y)
+		    if i % 2 == 0
+		        l = loss(src, trg, trg_y)
 		    	println("loss = $l")
+				@save "model-checkpoint.bson" ps
+				if l < 1e-3
+					continue
+				end
+				#with_logger(lg)
+				    #@info "train" loss=l log_step_increment=0
+				
 		    end
 		    Flux.update!(opt, ps, grad)
 		end
@@ -146,7 +157,20 @@ begin
 end
 
 # ╔═╡ 1bdfed3f-6cca-4038-b2e0-5cb11175e1ec
-
+begin
+	@show enc_seq_len
+	ix = data[1:enc_seq_len,1]
+	ix = reshape(ix,(1,enc_seq_len,1))
+	@show size(data),size(ix)
+	sz = size(ix)
+	enc = encoder_forward(ix)
+	for i = 1:output_sequence_length
+		trg = ix[:,sz[2]-output_sequence_length+1:sz[2],:]
+		dec = decoder_forward(trg, enc)
+		global ix = hcat(ix,reshape(dec,(1,output_sequence_length,1))[:,end,:])
+	end
+	@show ix
+end
 
 # ╔═╡ f16a325e-fc99-400b-9ce9-e7d1d06491ac
 
@@ -175,11 +199,13 @@ end
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
+BSON = "fbb218c0-5317-5bc6-957e-2ee96dd4b1f0"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 TimeSeries = "9e3dc215-6440-5c97-bce1-76c03772f85e"
 Transformers = "21ca0261-441d-5938-ace7-c90938fde4d4"
 
 [compat]
+BSON = "~0.3.5"
 Flux = "~0.12.10"
 TimeSeries = "~0.23.0"
 Transformers = "~0.1.15"
@@ -254,15 +280,15 @@ version = "0.4.2"
 
 [[deps.CUDA]]
 deps = ["AbstractFFTs", "Adapt", "BFloat16s", "CEnum", "CompilerSupportLibraries_jll", "ExprTools", "GPUArrays", "GPUCompiler", "LLVM", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "Printf", "Random", "Random123", "RandomNumbers", "Reexport", "Requires", "SparseArrays", "SpecialFunctions", "TimerOutputs"]
-git-tree-sha1 = "bc6de7d0852de77a036a8648823b7edaf5a82852"
+git-tree-sha1 = "19fb33957a5f85efb3cc10e70cf4dd4e30174ac9"
 uuid = "052768ef-5323-5732-b1bb-66c8b64840ba"
-version = "3.9.1"
+version = "3.10.0"
 
 [[deps.ChainRules]]
 deps = ["ChainRulesCore", "Compat", "IrrationalConstants", "LinearAlgebra", "Random", "RealDot", "SparseArrays", "Statistics"]
-git-tree-sha1 = "ab656fb36197083c5817667e76cccd10d11f5c30"
+git-tree-sha1 = "de68815ccf15c7d3e3e3338f0bd3a8a0528f9b9f"
 uuid = "082447d4-558c-5d27-93f4-14fc19e9eca2"
-version = "1.32.0"
+version = "1.33.0"
 
 [[deps.ChainRulesCore]]
 deps = ["Compat", "LinearAlgebra", "SparseArrays"]
@@ -397,9 +423,9 @@ version = "0.12.10"
 
 [[deps.ForwardDiff]]
 deps = ["CommonSubexpressions", "DiffResults", "DiffRules", "LinearAlgebra", "LogExpFunctions", "NaNMath", "Preferences", "Printf", "Random", "SpecialFunctions", "StaticArrays"]
-git-tree-sha1 = "89cc49bf5819f0a10a7a3c38885e7c7ee048de57"
+git-tree-sha1 = "2f18915445b248731ec5db4e4a17e451020bf21e"
 uuid = "f6369f11-7733-5829-9624-2563aa707210"
-version = "0.10.29"
+version = "0.10.30"
 
 [[deps.Functors]]
 git-tree-sha1 = "223fffa49ca0ff9ce4f875be001ffe173b2b7de4"
@@ -414,9 +440,9 @@ version = "8.3.2"
 
 [[deps.GPUCompiler]]
 deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "TimerOutputs", "UUIDs"]
-git-tree-sha1 = "556190e1e0ea3e37d83059fc9aa576f1e2104375"
+git-tree-sha1 = "d8c5999631e1dc18d767883f621639c838f8e632"
 uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
-version = "0.14.1"
+version = "0.15.2"
 
 [[deps.HTML_Entities]]
 deps = ["StrTables"]
@@ -607,9 +633,9 @@ uuid = "a00861dc-f156-4864-bf3c-e6376f28a68d"
 version = "0.2.2"
 
 [[deps.NaNMath]]
-git-tree-sha1 = "737a5957f387b17e74d4ad2f440eb330b39a62c5"
+git-tree-sha1 = "b086b7ea07f8e38cf122f5016af580881ac914fe"
 uuid = "77ba4419-2d1f-58cd-9bb1-8ffee604a2e3"
-version = "1.0.0"
+version = "0.3.7"
 
 [[deps.NetworkOptions]]
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
@@ -736,15 +762,15 @@ uuid = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [[deps.SpecialFunctions]]
 deps = ["ChainRulesCore", "IrrationalConstants", "LogExpFunctions", "OpenLibm_jll", "OpenSpecFun_jll"]
-git-tree-sha1 = "5ba658aeecaaf96923dce0da9e703bd1fe7666f9"
+git-tree-sha1 = "bc40f042cfcc56230f781d92db71f0e21496dffd"
 uuid = "276daf66-3868-5448-9aa4-cd146d93841b"
-version = "2.1.4"
+version = "2.1.5"
 
 [[deps.Static]]
 deps = ["IfElse"]
-git-tree-sha1 = "5309da1cdef03e95b73cd3251ac3a39f887da53e"
+git-tree-sha1 = "3a2a99b067090deb096edecec1dc291c5b4b31cb"
 uuid = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
-version = "0.6.4"
+version = "0.6.5"
 
 [[deps.StaticArrays]]
 deps = ["LinearAlgebra", "Random", "Statistics"]
