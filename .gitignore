@@ -26,3 +26,5 @@ Manifest.toml
 tensorboard_logs*
 checkpoint*
 *bson
+*png
+*csv

@@ -86,7 +86,7 @@ begin
 	  x = encoder_input_layer(x)
 	  e = positional_encoding_layer(x)
 	  t1 = x .+ e
-	  e = dropout_pos_enc(t1)
+	  t1 = dropout_pos_enc(t1)
 	  t1 = encode_t1(t1)
 	  return t1
 	end
@@ -126,12 +126,12 @@ begin
 	data = convert(Array{Float32,2}, data)
 	data_sz = size(data)
 	thd = floor(Int,data_sz[2]/3)
-	data = data[:,1:thd]
+	data = data[:,1:32]
 	ps = params(encoder_input_layer, positional_encoding_layer, encode_t1, decoder_input_layer, decode_t1,  linear)
 	all_layers = [ encoder_input_layer, positional_encoding_layer, encode_t1, decoder_input_layer, decode_t1,  linear ]
 	opt = ADAM(1e-4)
 	train_loader = Flux.Data.DataLoader(data, batchsize=32) 
-	for i = 1:10
+	for i = 1:1000
 		for x in train_loader
 			sz = size(x)
 			sub_sequence = reshape(x,(1,sz[1],sz[2]))
@@ -143,22 +143,18 @@ begin
 							    )
 			#src, trg, trg_y = todevice(src, trg, trg_y) #move to gpu
 			grad = gradient(()->loss(src, trg, trg_y), ps)
-		    if i % 2 == 0
-		        l = loss(src, trg, trg_y)
-		    	println("loss = $l")
-				@save "checkpoint/weights.bson" ps
-				for (j,layer) in enumerate(all_layers)
-					@save "checkpoint/model-"*string(j)*".bson" layer
-				end
-				if l < 1e-3
-					continue
-				end
-				with_logger(lg) do
-				    @info "train" loss=l log_step_increment=1
-				end
-				
-		    end
+
 		    Flux.update!(opt, ps, grad)
+		end
+		l = loss(src, trg, trg_y)
+		for (j,layer) in enumerate(all_layers)
+			@save "checkpoint/model-"*string(j)*".bson" layer
+		end
+		if l < 1e-3
+			continue
+		end
+		with_logger(lg) do
+			@info "train" loss=l log_step_increment=1
 		end
 	end
 end
