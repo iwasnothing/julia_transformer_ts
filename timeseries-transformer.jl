@@ -14,14 +14,16 @@ begin
 	using Flux.Optimise: update!
 	using BSON: @save
 	using TensorBoardLogger, Logging
-	#using CUDA
+	using CUDA
+	using Statistics
+	using MarketData
 end
 
 # ╔═╡ 432c36f2-2cf8-4732-8be9-644036af53be
 using Plots
 
 # ╔═╡ 57c64197-8bbe-471f-b529-a844039e0139
-#gpu_enabled = enable_gpu(true)
+gpu_enabled = enable_gpu(true)
 
 # ╔═╡ 3e49e54c-5d22-4c2c-9d3f-708848b64de7
 ta = readtimearray("rate.csv", format="mm/dd/yy", delim=',')
@@ -69,10 +71,10 @@ end
 begin
 	#define 2 layer of transformer
 	encode_t1 = Transformer(dim_val, n_heads, 64, 2048;future=false,pdrop=0.2)|> gpu
-	
+	encode_t2 = Transformer(dim_val, n_heads, 64, 2048;future=false,pdrop=0.2)|> gpu
 	#define 2 layer of transformer decoder
 	decode_t1 = TransformerDecoder(dim_val, n_heads, 64, 2048,pdrop=0.2) |> gpu
-
+	decode_t2 = TransformerDecoder(dim_val, n_heads, 64, 2048,pdrop=0.2) |> gpu
 	encoder_input_layer = Dense(input_size,dim_val) |> gpu
 	decoder_input_layer = Dense(input_size,dim_val) |> gpu
 	positional_encoding_layer = PositionEmbedding(dim_val) |> gpu
@@ -88,12 +90,14 @@ begin
 	  t1 = x .+ e
 	  t1 = dropout_pos_enc(t1)
 	  t1 = encode_t1(t1)
+	  t1 = encode_t2(t1)
 	  return t1
 	end
 	
 	function decoder_forward(tgt, t1)
 	  decoder_output = decoder_input_layer(tgt)
 	  t2 = decode_t1(decoder_output,t1)
+	  t2 = decode_t1(decoder_output,t2)
 	  t2 = Flux.flatten(t2)
 	  p = linear(t2)
 	  return p
@@ -118,19 +122,41 @@ function loss(src, trg, trg_y)
   return err
 end
 
+# ╔═╡ 655e83b2-e316-4904-9334-f7d4f75a959a
+begin
+	sincurve1 = Vector{Float64}()
+	for i in 1:500
+		append!(sincurve1,sin(i))
+	end
+end
+
+# ╔═╡ facfe523-558d-4155-9ffa-e87d5b3fbcc4
+length(sincurve1)
+
+# ╔═╡ da0f9aa0-038a-44cf-b5ae-9462150c8b5e
+generate_seq(sincurve1,enc_seq_len+output_sequence_length)
+
+# ╔═╡ 6a13dd7b-1666-4ad0-ad20-86fb4d88c3b0
+ta_mv = moving(mean,ta,15)
+
 # ╔═╡ b9698341-42c8-4354-93fc-6cec0b606416
 begin
 	lg=TBLogger("tensorboard_logs/run", min_level=Logging.Info)
-	data = generate_seq(values(ta[:"10 YR"]),enc_seq_len+output_sequence_length)
+	data = generate_seq(values(moving(mean,cl,15)),enc_seq_len+output_sequence_length)
+	#data = generate_seq(values(ta_mv[:"10 YR"]),enc_seq_len+output_sequence_length)
+	#data = generate_seq(sincurve1,enc_seq_len+output_sequence_length)
+	@show size(data)
 	data = reduce(hcat,data)
 	data = convert(Array{Float32,2}, data)
 	data_sz = size(data)
-	thd = floor(Int,data_sz[2]/3)
-	data = data[:,1:32]
-	ps = params(encoder_input_layer, positional_encoding_layer, encode_t1, decoder_input_layer, decode_t1,  linear)
-	all_layers = [ encoder_input_layer, positional_encoding_layer, encode_t1, decoder_input_layer, decode_t1,  linear ]
+	thd = floor(Int,data_sz[2]/2)
+	testdata = data[:,thd+1:end]
+	data = data[:,1:thd]
+	ps = params(encoder_input_layer, positional_encoding_layer, encode_t1, encode_t2, decoder_input_layer, decode_t1,decode_t2,  linear)
+	all_layers = [ encoder_input_layer, positional_encoding_layer, encode_t1, encode_t2, decoder_input_layer, decode_t1, decode_t2, linear ]
 	opt = ADAM(1e-4)
 	train_loader = Flux.Data.DataLoader(data, batchsize=32) 
+	l = 100
 	for i = 1:1000
 		for x in train_loader
 			sz = size(x)
@@ -141,67 +167,128 @@ begin
 							    dec_seq_len,
 							    output_sequence_length
 							    )
-			#src, trg, trg_y = todevice(src, trg, trg_y) #move to gpu
+			src, trg, trg_y = todevice(src, trg, trg_y) #move to gpu
 			grad = gradient(()->loss(src, trg, trg_y), ps)
-
-		    Flux.update!(opt, ps, grad)
+			Flux.update!(opt, ps, grad)
+			global l = collect(loss(src, trg, trg_y))[1]
+		    if l < 1e-3
+				continue
+			end
 		end
-		l = loss(src, trg, trg_y)
-		for (j,layer) in enumerate(all_layers)
-			@save "checkpoint/model-"*string(j)*".bson" layer
+		if i % 10 == 0		
+			for (j,layer) in enumerate(all_layers)
+				@save "checkpoint/model-"*string(j)*".bson" layer
+			end
+			with_logger(lg) do
+				@info "train" loss=l log_step_increment=1
+			end
 		end
 		if l < 1e-3
-			continue
-		end
-		with_logger(lg) do
-			@info "train" loss=l log_step_increment=1
+				continue
 		end
 	end
 end
 
 # ╔═╡ 1bdfed3f-6cca-4038-b2e0-5cb11175e1ec
-begin
-	@show enc_seq_len
-	ix = data[1:enc_seq_len,1]
-	ix = reshape(ix,(1,enc_seq_len,1))
-	@show size(data),size(ix)
-	sz = size(ix)
-	enc = encoder_forward(ix)
-	for i = 1:output_sequence_length
-		trg = ix[:,sz[2]-output_sequence_length+1:sz[2],:]
+function prediction(test_data)
+	seq = Array{Float32}[]
+	test_loader = Flux.Data.DataLoader(test_data, batchsize=32)
+	for x in test_loader
+		sz = size(x)
+		sub_sequence = reshape(x,(1,sz[1],sz[2]))
+		#@show enc_seq_len 
+		ix = sub_sequence[:,1:enc_seq_len+output_sequence_length,:]
+		#@show size(x),size(ix)
+		ix = todevice(ix)
+		enc = encoder_forward(ix[:,1:enc_seq_len,:])
+		trg = ix[:,enc_seq_len:sz[1]-1,:]
+		#@show size(trg),size(enc)
 		dec = decoder_forward(trg, enc)
-		global ix = hcat(ix,reshape(dec,(1,output_sequence_length,1))[:,end,:])
+		#@show size(dec[end,:])
+		seq = vcat(seq,collect(dec[end,:]))
 	end
-	@show ix
+	return seq
+end
+
+# ╔═╡ 44c91ed2-5500-48ea-8d91-04347b3998e1
+seq_train = prediction(data)
+
+# ╔═╡ 77e65945-2a10-4723-979a-f33170e71500
+seq_test = prediction(testdata)
+
+# ╔═╡ d917655a-56e3-42e4-bfb6-9dcb4833be27
+function myplot(seq1,seq2)
+	plot(seq1)
+	plot!(seq2)
 end
 
 # ╔═╡ a825fb11-3a40-4b5c-8317-d5e329784b52
-plot(data[:,1])	
+fig = myplot(data[end,:],seq_train)	
+
+# ╔═╡ 4ded81de-cc15-4e5a-917f-541d1440b75c
+savefig(fig,"train_fig.png")
 
 # ╔═╡ 3e9bbff6-b21e-408c-889c-a645b8469c74
-plot(ix[1,:,1])
+myplot(testdata[end,:],seq_test)
+
+# ╔═╡ b2734948-53a5-44e0-a724-3ee68aeada36
+savefig(fig,"test_fig.png")
 
 # ╔═╡ 883659b9-e86d-4d0f-b184-d6ceccb554d4
-size(ix)
+Flux.Losses.mse(testdata[end,:],seq_test)
 
 # ╔═╡ 892f7976-2a3e-4dc0-b9fe-ef3e28e73edf
-floor(Int,data_sz[2]/3)
+Flux.Losses.mse(data[end,:],seq_train)
+
+
+# ╔═╡ 4d401898-e5a1-460a-9ff9-d03a6fd72ae4
+Flux.Losses.mse(testdata[end,:],testdata[end-1,:])
+
+# ╔═╡ cea6514f-7a80-4ac5-a1f0-87967ba402e5
+a,b = size(testdata)
+
+# ╔═╡ e88b7942-44cc-41f1-8e86-3243bee0e83c
+begin
+	row1 = reshape(testdata[:,1], (a,1))
+	
+	for i in 1:a
+		row1 = todevice(row1)
+		seq = prediction(row1)
+		seq = collect(seq)
+		row1 = collect(row1)
+		global row1 = vcat(row1, reshape(seq,(1,1)))
+		#@show size(row1)
+		global row1 = row1[2:end,:]
+	end
+	plot(row1[:,1])
+	plot!(testdata[:,1])
+end
+
+# ╔═╡ 5051f869-272a-42cd-92d6-8dc66baacf62
+row1
+
+# ╔═╡ 9be5dd7c-de1a-42ed-a628-4e6aa91f10c6
 
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
 BSON = "fbb218c0-5317-5bc6-957e-2ee96dd4b1f0"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+MarketData = "945b72a4-3b13-509d-9b46-1525bb5c06de"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 TensorBoardLogger = "899adc3e-224a-11e9-021f-63837185c80f"
 TimeSeries = "9e3dc215-6440-5c97-bce1-76c03772f85e"
 Transformers = "21ca0261-441d-5938-ace7-c90938fde4d4"
 
 [compat]
 BSON = "~0.3.5"
+CUDA = "~3.10.0"
 Flux = "~0.12.10"
+MarketData = "~0.13.11"
 Plots = "~1.29.0"
 TensorBoardLogger = "~0.1.19"
 TimeSeries = "~0.23.0"
@@ -284,6 +371,12 @@ version = "0.4.2"
 [[deps.CRC32c]]
 uuid = "8bf52ea8-c179-5cab-976a-9e18b702a9bc"
 
+[[deps.CSV]]
+deps = ["CodecZlib", "Dates", "FilePathsBase", "InlineStrings", "Mmap", "Parsers", "PooledArrays", "SentinelArrays", "Tables", "Unicode", "WeakRefStrings"]
+git-tree-sha1 = "873fb188a4b9d76549b81465b1f75c82aaf59238"
+uuid = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+version = "0.10.4"
+
 [[deps.CUDA]]
 deps = ["AbstractFFTs", "Adapt", "BFloat16s", "CEnum", "CompilerSupportLibraries_jll", "ExprTools", "GPUArrays", "GPUCompiler", "LLVM", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "Printf", "Random", "Random123", "RandomNumbers", "Reexport", "Requires", "SparseArrays", "SpecialFunctions", "TimerOutputs"]
 git-tree-sha1 = "19fb33957a5f85efb3cc10e70cf4dd4e30174ac9"
@@ -298,9 +391,9 @@ version = "1.16.1+1"
 
 [[deps.ChainRules]]
 deps = ["ChainRulesCore", "Compat", "IrrationalConstants", "LinearAlgebra", "Random", "RealDot", "SparseArrays", "Statistics"]
-git-tree-sha1 = "de68815ccf15c7d3e3e3338f0bd3a8a0528f9b9f"
+git-tree-sha1 = "c03a0bc97fb045e417fe35a4533e6135b59babdc"
 uuid = "082447d4-558c-5d27-93f4-14fc19e9eca2"
-version = "1.33.0"
+version = "1.34.0"
 
 [[deps.ChainRulesCore]]
 deps = ["Compat", "LinearAlgebra", "SparseArrays"]
@@ -334,9 +427,9 @@ version = "0.11.2"
 
 [[deps.ColorVectorSpace]]
 deps = ["ColorTypes", "FixedPointNumbers", "LinearAlgebra", "SpecialFunctions", "Statistics", "TensorCore"]
-git-tree-sha1 = "3f1f500312161f1ae067abe07d13b40f78f32e07"
+git-tree-sha1 = "d08c20eef1f2cbc6e60fd3612ac4340b89fea322"
 uuid = "c3611d14-8923-5661-9e6a-0046d554d3a4"
-version = "0.9.8"
+version = "0.9.9"
 
 [[deps.Colors]]
 deps = ["ColorTypes", "FixedPointNumbers", "Reexport"]
@@ -463,6 +556,12 @@ git-tree-sha1 = "9267e5f50b0e12fdfd5a2455534345c4cf2c7f7a"
 uuid = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 version = "1.14.0"
 
+[[deps.FilePathsBase]]
+deps = ["Compat", "Dates", "Mmap", "Printf", "Test", "UUIDs"]
+git-tree-sha1 = "129b104185df66e408edd6625d480b7f9e9823a0"
+uuid = "48062228-2e41-5def-b9a4-89aafe57970f"
+version = "0.9.18"
+
 [[deps.FillArrays]]
 deps = ["LinearAlgebra", "Random", "SparseArrays", "Statistics"]
 git-tree-sha1 = "246621d23d1f43e3b9c368bf3b72b2331a27c286"
@@ -515,6 +614,10 @@ version = "1.0.10+0"
 git-tree-sha1 = "223fffa49ca0ff9ce4f875be001ffe173b2b7de4"
 uuid = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 version = "0.2.8"
+
+[[deps.Future]]
+deps = ["Random"]
+uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
 
 [[deps.GLFW_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Libglvnd_jll", "Pkg", "Xorg_libXcursor_jll", "Xorg_libXi_jll", "Xorg_libXinerama_jll", "Xorg_libXrandr_jll"]
@@ -620,6 +723,12 @@ version = "0.9.3"
 git-tree-sha1 = "f550e6e32074c939295eb5ea6de31849ac2c9625"
 uuid = "83e8ac13-25f8-5344-8a64-a9f2b223428f"
 version = "0.5.1"
+
+[[deps.InlineStrings]]
+deps = ["Parsers"]
+git-tree-sha1 = "61feba885fac3a407465726d0c330b3055df897f"
+uuid = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
+version = "1.1.2"
 
 [[deps.InteractiveUtils]]
 deps = ["Markdown"]
@@ -828,6 +937,12 @@ version = "0.4.1"
 deps = ["Base64"]
 uuid = "d6f4376e-aef5-505a-96c1-9c027394607a"
 
+[[deps.MarketData]]
+deps = ["CSV", "Dates", "HTTP", "JSON3", "Random", "Reexport", "TimeSeries"]
+git-tree-sha1 = "b23d02b936456191c7198c9c5f20355c010672d5"
+uuid = "945b72a4-3b13-509d-9b46-1525bb5c06de"
+version = "0.13.11"
+
 [[deps.MbedTLS]]
 deps = ["Dates", "MbedTLS_jll", "Random", "Sockets"]
 git-tree-sha1 = "1c38e51c3d08ef2278062ebceade0e46cefc96fe"
@@ -875,9 +990,9 @@ version = "0.8.5"
 
 [[deps.NNlibCUDA]]
 deps = ["CUDA", "LinearAlgebra", "NNlib", "Random", "Statistics"]
-git-tree-sha1 = "0d18b4c80a92a00d3d96e8f9677511a7422a946e"
+git-tree-sha1 = "e161b835c6aa9e2339c1e72c3d4e39891eac7a4f"
 uuid = "a00861dc-f156-4864-bf3c-e6376f28a68d"
-version = "0.2.2"
+version = "0.2.3"
 
 [[deps.NaNMath]]
 git-tree-sha1 = "b086b7ea07f8e38cf122f5016af580881ac914fe"
@@ -982,6 +1097,12 @@ git-tree-sha1 = "d457f881ea56bbfa18222642de51e0abf67b9027"
 uuid = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
 version = "1.29.0"
 
+[[deps.PooledArrays]]
+deps = ["DataAPI", "Future"]
+git-tree-sha1 = "a6062fe4063cdafe78f4a0a81cfffb89721b30e7"
+uuid = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
+version = "1.4.2"
+
 [[deps.Preferences]]
 deps = ["TOML"]
 git-tree-sha1 = "47e5f437cc0e7ef2ce8406ce1e7e24d44915f88d"
@@ -1076,6 +1197,12 @@ deps = ["Dates"]
 git-tree-sha1 = "0b4b7f1393cff97c33891da2a0bf69c6ed241fda"
 uuid = "6c6a2e73-6563-6170-7368-637461726353"
 version = "1.1.0"
+
+[[deps.SentinelArrays]]
+deps = ["Dates", "Random"]
+git-tree-sha1 = "6a2f7d70512d205ca8c7ee31bfa9f142fe74310c"
+uuid = "91c51154-3ec4-41a3-a24f-3f23e20d615c"
+version = "1.3.12"
 
 [[deps.Serialization]]
 uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
@@ -1272,6 +1399,12 @@ deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
 git-tree-sha1 = "4528479aa01ee1b3b4cd0e6faef0e04cf16466da"
 uuid = "2381bf8a-dfd0-557d-9999-79630e7b1b91"
 version = "1.25.0+0"
+
+[[deps.WeakRefStrings]]
+deps = ["DataAPI", "InlineStrings", "Parsers"]
+git-tree-sha1 = "b1be2855ed9ed8eac54e5caff2afcdb442d52c23"
+uuid = "ea10d353-3f73-51f8-a26c-33c1cb351aa5"
+version = "1.4.2"
 
 [[deps.WordTokenizers]]
 deps = ["DataDeps", "HTML_Entities", "StrTables", "Unicode"]
@@ -1515,12 +1648,26 @@ version = "0.9.1+5"
 # ╠═cbf568ae-c0cc-4f21-b14b-07ca25124419
 # ╠═9e59ecce-8c16-4741-bdbf-4a47c0fa2c72
 # ╠═5647a807-ca53-4b4e-b7a1-50245a92909e
+# ╠═655e83b2-e316-4904-9334-f7d4f75a959a
+# ╠═facfe523-558d-4155-9ffa-e87d5b3fbcc4
+# ╠═da0f9aa0-038a-44cf-b5ae-9462150c8b5e
+# ╠═6a13dd7b-1666-4ad0-ad20-86fb4d88c3b0
 # ╠═b9698341-42c8-4354-93fc-6cec0b606416
 # ╠═1bdfed3f-6cca-4038-b2e0-5cb11175e1ec
+# ╠═44c91ed2-5500-48ea-8d91-04347b3998e1
+# ╠═77e65945-2a10-4723-979a-f33170e71500
 # ╠═432c36f2-2cf8-4732-8be9-644036af53be
+# ╠═d917655a-56e3-42e4-bfb6-9dcb4833be27
 # ╠═a825fb11-3a40-4b5c-8317-d5e329784b52
+# ╠═4ded81de-cc15-4e5a-917f-541d1440b75c
 # ╠═3e9bbff6-b21e-408c-889c-a645b8469c74
+# ╠═b2734948-53a5-44e0-a724-3ee68aeada36
 # ╠═883659b9-e86d-4d0f-b184-d6ceccb554d4
 # ╠═892f7976-2a3e-4dc0-b9fe-ef3e28e73edf
+# ╠═4d401898-e5a1-460a-9ff9-d03a6fd72ae4
+# ╠═cea6514f-7a80-4ac5-a1f0-87967ba402e5
+# ╠═e88b7942-44cc-41f1-8e86-3243bee0e83c
+# ╠═5051f869-272a-42cd-92d6-8dc66baacf62
+# ╠═9be5dd7c-de1a-42ed-a628-4e6aa91f10c6
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
